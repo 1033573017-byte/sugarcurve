@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SugarCurve — Sugar Control Companion</title>
+<style>
+  :root { --bg:#0f1419; --card:#1a222c; --line:#2a3644; --text:#e8eef4; --muted:#8fa3b5; --accent:#4ade80; --warn:#fbbf24; --bad:#f87171; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family:-apple-system,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); padding:16px; max-width:560px; margin:0 auto; }
+  h1 { font-size:22px; margin-bottom:2px; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; margin-bottom:14px; }
+  .row { display:flex; gap:8px; }
+  select, input { flex:1; background:#0d1117; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:10px; font-size:14px; min-width:0; }
+  button { background:var(--accent); color:#052e12; border:none; border-radius:8px; padding:10px 16px; font-weight:700; cursor:pointer; font-size:14px; }
+  button:active { opacity:.8; }
+  .stats { display:flex; gap:10px; text-align:center; }
+  .stat { flex:1; }
+  .stat b { display:block; font-size:22px; }
+  .stat span { color:var(--muted); font-size:11px; }
+  canvas { width:100%; height:160px; display:block; }
+  ul { list-style:none; }
+  li { display:flex; justify-content:space-between; padding:8px 2px; border-bottom:1px solid var(--line); font-size:14px; }
+  li:last-child { border-bottom:none; }
+  li .g { color:var(--warn); font-variant-numeric:tabular-nums; }
+  li button { background:none; color:var(--bad); padding:2px 6px; font-size:13px; }
+  .empty { color:var(--muted); font-size:13px; padding:6px 2px; }
+  .goal-ok { color:var(--accent); } .goal-over { color:var(--bad); }
+  h2 { font-size:15px; margin-bottom:8px; }
+</style>
+</head>
+<body>
+<h1>SugarCurve</h1>
+<p class="sub">Sugar-control companion — log a meal, see its sugar load and your estimated glucose curve.</p>
+
+<div class="card">
+  <div class="row">
+    <select id="food"></select>
+    <input id="grams" type="number" value="100" min="10" step="10" aria-label="grams">
+    <button id="add">Add</button>
+  </div>
+</div>
+
+<div class="card stats">
+  <div class="stat"><b id="total">0g</b><span>sugar today</span></div>
+  <div class="stat"><b id="goalState">—</b><span>goal 50g/day</span></div>
+  <div class="stat"><b id="streak">0</b><span>day streak under goal</span></div>
+</div>
+
+<div class="card">
+  <h2>Estimated glucose curve (next 3 hours)</h2>
+  <canvas id="curve" width="520" height="160"></canvas>
+</div>
+
+<div class="card">
+  <h2>Today's meals</h2>
+  <ul id="log"></ul>
+  <p class="empty" id="emptyMsg">Nothing logged yet today.</p>
+</div>
+
+<script>
+// Sugar content per 100g (grams of sugar). Starter database — the Devin Bot
+// build expands this into a full food database with GI values.
+const FOODS = {
+  "White rice (cooked)": 0.1, "Brown rice (cooked)": 0.4, "Instant noodles": 2.0,
+  "White bread": 5.0, "Whole wheat bread": 4.3, "Croissant": 7.0,
+  "Cola": 10.6, "Bubble tea (50% sugar)": 8.0, "Orange juice": 8.8,
+  "Latte (sweetened)": 6.0, "Black coffee": 0.0, "Green tea (unsweetened)": 0.0,
+  "Banana": 12.2, "Apple": 10.4, "Grapes": 16.0, "Watermelon": 6.2,
+  "Egg tart": 18.0, "Chocolate cake": 32.0, "Ice cream": 21.0,
+  "Yogurt (sweetened)": 12.0, "Yogurt (plain)": 4.7,
+  "Grilled chicken breast": 0.0, "Braised pork rice": 3.5, "Hotpot broth + dips": 2.5,
+  "Salad (no dressing)": 1.5, "French fries": 0.5, "Fried chicken": 1.0
+};
+// Glycemic speed factor per food group (how fast the sugar hits): drinks and
+// refined sweets spike fast, whole foods slower. Simplified model for v0.
+function speedFactor(name) {
+  if (/Cola|Bubble tea|juice/.test(name)) return 1.0;
+  if (/cake|tart|Ice cream|Chocolate/.test(name)) return 0.85;
+  if (/rice|noodles|bread|Croissant/.test(name)) return 0.7;
+  return 0.45;
+}
+
+const LS_KEY = "sugarcurve-log-v1";
+const todayKey = () => new Date().toISOString().slice(0, 10);
+function loadLog() {
+  try { return JSON.parse(localStorage.getItem(LS_KEY)) || {}; } catch { return {}; }
+}
+function saveLog(all) { localStorage.setItem(LS_KEY, JSON.stringify(all)); }
+function todaysMeals() { return loadLog()[todayKey()] || []; }
+
+function render() {
+  const meals = todaysMeals();
+  const total = meals.reduce((s, m) => s + m.sugar, 0);
+  document.getElementById("total").textContent = total.toFixed(1) + "g";
+  const gs = document.getElementById("goalState");
+  gs.textContent = total <= 50 ? "on track" : "over";
+  gs.className = total <= 50 ? "goal-ok" : "goal-over";
+
+  // Streak: consecutive past days (including today if logged & under goal)
+  // whose total sugar stayed at or under 50g.
+  const all = loadLog();
+  let streak = 0;
+  const d = new Date();
+  for (let i = 0; i < 365; i++) {
+    const key = d.toISOString().slice(0, 10);
+    const day = all[key];
+    if (day && day.length && day.reduce((s, m) => s + m.sugar, 0) <= 50) streak++;
+    else if (i > 0) break;
+    else if (!day) break;
+    d.setDate(d.getDate() - 1);
+  }
+  document.getElementById("streak").textContent = streak;
+
+  const ul = document.getElementById("log");
+  ul.innerHTML = "";
+  document.getElementById("emptyMsg").style.display = meals.length ? "none" : "block";
+  meals.forEach((m, i) => {
+    const li = document.createElement("li");
+    li.innerHTML = `<span>${m.name} · ${m.grams}g</span><span class="g">${m.sugar.toFixed(1)}g sugar</span>`;
+    const del = document.createElement("button");
+    del.textContent = "✕";
+    del.onclick = () => {
+      const all = loadLog(); all[todayKey()].splice(i, 1); saveLog(all); render();
+    };
+    li.appendChild(del);
+    ul.appendChild(li);
+  });
+  drawCurve(meals);
+}
+
+// Estimated post-meal glucose: baseline 5.2 mmol/L; each meal adds a bump
+// peaking ~45 min after eating, height scaled by sugar grams and GI speed,
+// decaying over ~2 hours. Illustrative model, not a medical measurement.
+function drawCurve(meals) {
+  const c = document.getElementById("curve"), ctx = c.getContext("2d");
+  const W = c.width, H = c.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.strokeStyle = "#2a3644"; ctx.beginPath();
+  for (let i = 1; i < 4; i++) { ctx.moveTo(0, H * i / 4); ctx.lineTo(W, H * i / 4); }
+  ctx.stroke();
+  const now = Date.now();
+  ctx.strokeStyle = "#4ade80"; ctx.lineWidth = 2; ctx.beginPath();
+  for (let x = 0; x <= W; x++) {
+    const t = now - 30 * 60000 + (x / W) * 3.5 * 3600000; // -30min .. +3h
+    let g = 5.2;
+    for (const m of meals) {
+      const dt = (t - m.time) / 60000; // minutes since meal
+      if (dt < 0 || dt > 180) continue;
+      const peak = m.sugar * 0.045 * speedFactor(m.name);
+      g += peak * Math.sin(Math.min(dt / 45, 1) * Math.PI / 2) * Math.exp(-Math.max(0, dt - 45) / 70);
+    }
+    const y = H - ((g - 4) / 6) * H;
+    x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  ctx.lineWidth = 1; ctx.fillStyle = "#8fa3b5"; ctx.font = "11px sans-serif";
+  ctx.fillText("baseline 5.2 mmol/L · model estimate, not a medical reading", 8, 14);
+}
+
+const sel = document.getElementById("food");
+Object.keys(FOODS).forEach(n => {
+  const o = document.createElement("option"); o.value = n; o.textContent = n; sel.appendChild(o);
+});
+document.getElementById("add").onclick = () => {
+  const name = sel.value;
+  const grams = Math.max(10, Number(document.getElementById("grams").value) || 100);
+  const sugar = FOODS[name] * grams / 100;
+  const all = loadLog();
+  (all[todayKey()] = all[todayKey()] || []).push({ name, grams, sugar, time: Date.now() });
+  saveLog(all); render();
+};
+render();
+setInterval(drawCurve.bind(null, todaysMeals()), 60000);
+</script>
+</body>
+</html>
